@@ -1,0 +1,210 @@
+rm(list = ls())
+
+library(data.table)
+library(magrittr)
+library(lubridate)
+library(janitor)
+library(moments)
+library(arrow)
+library(dplyr)
+library(glue)
+library(purrr)
+library(zoo)
+library(stringr)
+library(openxlsx)
+library(tidyr)
+library(lubridate)
+library(reshape2)
+library(ggplot2)
+library(latex2exp)
+library(corrr)
+library(psych)
+library(readxl)
+library(gt)
+library(tsibble)
+
+# dados <- read_excel("2023-04-05-Dados_Brutos_Lençol_Freático.xlsx",
+#                     col_names = FALSE,) %>%
+#   filter(!row_number() %in% c(2, 3, 4, 6, 7)) %>%
+#   select(-c(1)) %>%
+#   setDT()
+
+
+dados <- read_excel("2023-04-05-Dados_Brutos_Lençol_Freático.xlsx",
+                    col_names = FALSE,) %>%
+  filter(!row_number() %in% c(2, 3, 4, 6, 7)) %>%
+  select(-c(1)) %>%
+  setDT()
+
+# data table com os valores da altura Z ----------------------------------------
+
+z <- dados %>%
+  filter(row_number() %in%  c(1, 2)) %>%
+  select_if(~ !any(is.na(.))) %>%
+  t() %>%
+  as.data.frame() %>%
+  setDT() %>%
+  set_names(c("Marco", "Z")) %>%
+  mutate(Z = as.numeric(Z))
+
+# lista com os dados de cada marco ---------------------------------------------
+
+dados_lista <- list()
+
+for(i in seq(1,ncol(dados)-1,2)){
+  dados_lista[[i]] <- list(z[(i+1)/2,], dados[,i:(i+1)])
+}
+
+dados_lista <- dados_lista %>%
+  compact()
+
+estrutura_base <- function(x){
+  dados <- x %>%
+    pluck(2) %>%
+    set_names(c("data", "PN")) %>%
+    .[-c(1,2)] %>%
+    mutate(PN = as.numeric(PN)) %>%
+    mutate(data = excel_numeric_to_date(as.numeric(data))) %>%
+    mutate(Mes = months(data),
+           Ano = year(data),
+           semana= week(data),
+           Estacao = as.factor(ifelse(Mes %in% c("outubro", "novembro",
+                                                 "dezembro", "janeiro",
+                                                 "fevereiro", "março"),
+                                      "chuvosa", "seca")),
+           mes_referencia:=as.yearmon(data)) %>%
+    mutate(marco = as.numeric(rep(x[[1]][,2], nrow(.)))) %>%
+    mutate(nivel = marco - PN)
+  return(dados)
+}
+
+gera_base_niveis <- function(x){
+  dados <- estrutura_base(x) %>%
+    mutate(semana = ifelse(lead(semana) == semana & semana - lag(semana) ==2,
+                           semana-1, ifelse(lag(semana) == semana &
+                                              lead(semana) - semana == 2,
+                                            semana+1, semana))) %>%
+    mutate(semana_ano = paste0(semana, year(data))) %>%
+    select(c("semana_ano", "Estacao", "nivel")) %>%
+    setDT() %>%
+    .[, .(nivel = mean(nivel)), by = semana_ano]
+  return(dados)
+}
+
+merge_bases <- function(x){
+  dados <- estrutura_base(x)
+
+  semana <- week(seq(ymd(min(dados$data, na.rm = TRUE)),
+                     ymd(max(dados$data, na.rm = TRUE)), "weeks")) %>%
+    as.data.frame() %>%
+    mutate(ano = year(seq(ymd(min(dados$data, na.rm = TRUE)),
+                          ymd(max(dados$data, na.rm = TRUE)),
+                          "weeks"))) %>%
+    mutate(mes = month(seq(ymd(min(dados$data, na.rm = TRUE)),
+                           ymd(max(dados$data, na.rm = TRUE)),
+                           "weeks"))) %>%
+    mutate(Estacao = as.factor(ifelse(mes %in% c(10,11,12,1,2,3),
+                                      "Estação Chuvosa", "Estação Seca"))) %>%
+    set_names("semana", "ano", "mes", "Estacao") %>%
+    mutate(semana_ano = paste0(semana, ano))
+
+  dados_niveis <- gera_base_niveis(x)
+
+  merged_df <-left_join(semana,
+                        dados_niveis,
+                        by="semana_ano",
+                        all = TRUE) %>%
+    mutate(data = seq(ymd(min(dados$data, na.rm = TRUE)),
+                      ymd(max(dados$data, na.rm = TRUE)), "weeks"))
+  return(merged_df)
+
+}
+
+gera_figura <- function(x){
+
+  dados <- estrutura_base(x)
+
+  merged_df <- merge_bases(x)
+
+  chuvosa <- merged_df %>%
+    filter(Estacao == "Estação Chuvosa")
+
+  seca <- merged_df %>%
+    filter(Estacao=="Estação Seca")
+
+  Estacao <- merged_df$Estacao
+
+  period <- case_when(Estacao != lead(Estacao) & Estacao == "Estação Seca" ~ "endEstação Seca",
+                      Estacao != lead(Estacao) & Estacao == "Estação Chuvosa" ~ "endEstação Chuvosa",
+                      Estacao != lag(Estacao) & Estacao == "Estação Seca" ~ "beginEstação Seca",
+                      Estacao != lag(Estacao) & Estacao == "Estação Chuvosa" ~ "beginEstação Chuvosa")
+
+  period[1]              <- paste0("begin", as.character(Estacao[1]))
+  period[length(period)] <- "endEstação Chuvosa"
+
+
+  rect <- cbind(merged_df, period)
+
+  rect <- rect %>%
+    select(c("data", "Estacao", "period"))
+
+#
+#   rect_seca <- na.omit(rect[rect$Estacao == "Estação Seca", ])[ ,-2]
+#
+#   rect_seca <- data.frame(start = rect_seca[rect_seca$period == "beginEstação Seca", 1],
+#                           end  = rect_seca[rect_seca$period == "endEstação Seca", 1])
+
+
+
+  rect_chuvosa <- na.omit(rect[rect$Estacao == "Estação Chuvosa", ])
+  rect_chuvosa <- data.frame(start = rect_chuvosa[rect_chuvosa$period == "beginEstação Chuvosa", 1],
+                             end  = rect_chuvosa[rect_chuvosa$period == "endEstação Chuvosa", 1])%>%
+    setnames(c("inicio", "fim"))
+
+  ref <- estrutura_base(x)$marco[1]
+
+  title <- as.character(x[[1]][,1])
+
+ plot <-  ggplot(alpha = 0.3) +
+    geom_rect(data = rect_chuvosa,aes(xmin =inicio, xmax = fim,
+                                      ymin = min(merged_df$nivel,90, na.rm = TRUE),
+                                      ymax = ref + 0.5, fill="Estação Chuvosa"))+
+    scale_fill_manual(values = c('cyan'))+
+    geom_line(data = merged_df,
+              aes(x = data, y=nivel, col = "Cota do Lençol Freático"), size=1)+
+    geom_hline(aes(yintercept = 90, col = "Cota 90"), size = 1)+
+    geom_hline(aes(yintercept = ref, col="Cota do Terreno"), size = 1.4)+
+    ggtitle(title)+
+    theme(legend.title = element_blank())+
+    geom_smooth(data = merged_df, aes(x = data, y=nivel,  col="Tendência"),
+                method ="loess", size = 0.8)+
+    ylab("Cota (m)")+
+    scale_colour_manual("",
+                        breaks = c("Cota do Lençol Freático", "Cota 90",
+                                   "Cota do Terreno", "Tendência"),
+                        values = c("blue3", "red", "darkgoldenrod", "black"))
+
+  return(plot)
+}
+
+figuras_MD <- map(.x = dados_lista,
+                    .f = gera_figura)
+
+for (i in seq_along(figuras_MD)) {
+  ggsave(
+    path = "C:/Users/victo/Desktop/Comitti/Resplendor2023/resplendor2023/figurasMD",
+    filename = paste0(z$Marco[i], ".png"),
+    plot = figuras_ME[[i]]
+  )
+  print(i)
+}
+
+
+map2(seq_along(figuras_MD), z$Marco, function(i, marco) {
+  ggsave(
+    path = "C:/Users/victo/Desktop/Comitti/Resplendor2023/resplendor2023/figurasMD",
+    filename = paste0(marco, ".png"),
+    plot = figuras_MD[[i]]
+  )
+})
+
